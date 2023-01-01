@@ -12,9 +12,7 @@ import json
 import random
 import time
 from paho.mqtt import client as mqtt_client
-from multiprocessing import Process
 import RPi.GPIO as GPIO
-import _thread
 from urllib.parse import unquote
 import pygame
 
@@ -22,11 +20,6 @@ import io
 from picamera2 import Picamera2
 from picamera2.encoders import JpegEncoder
 from picamera2.outputs import FileOutput
-
-from flask import Flask, Response,render_template
-import pyaudio
-
-app = Flask(__name__)
 
 VersionInfo = "0.4p"
 
@@ -40,8 +33,15 @@ class enrollVariables():
     enrollName = ""
 
 touchRingPin = 18
+bellPin = 23
+doorOpenerPin = 24
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(touchRingPin, GPIO.IN)
+GPIO.setup(bellPin, GPIO.IN)
+GPIO.setup(doorOpenerPin, GPIO.OUT)
+
+class BellPin():
+    last = 0
 
 class Mode(Enum):
     scan = 1
@@ -93,6 +93,20 @@ def updateClientsFingerlist(fingerlist):
   print("New fingerlist was sent to clients")
   events.send(fingerlist.c_str(),"fingerlist",millis(),1000)
   
+def ringBell(client, topic):
+    mqttRootTopic = settingsManager.getAppSettings().mqttRootTopic
+    pygame.mixer.init()
+    pygame.mixer.music.load("klingel.mp3")
+    pygame.mixer.music.play()
+    
+    #messages = ["on", "-1", "", "-1"] 
+    #for i, topic in enumerate(topics):
+    MQTT.publishMessage(client, f'{mqttRootTopic}/{topic}', "on")
+    while pygame.mixer.music.get_busy() == True:
+        continue
+    MQTT.publishMessage(client, f'{mqttRootTopic}/{topic}', "off")
+    return
+  
 def doPairing():
     newPairingCode = settingsManager.generateNewPairingCode()
     if fingerManager.setPairingCode(newPairingCode):
@@ -129,19 +143,10 @@ def doScan(self):
         # No match -> ring bell
         elif str(match.scanResult) == str(ScanResult.noMatchFound):
             FingerprintManager.setLedRingReady()
-            pygame.mixer.init()
-            pygame.mixer.music.load("klingel.mp3")
-            pygame.mixer.music.play()
-            
-            messages = ["on", "-1", "", "-1"] 
-            for i, topic in enumerate(topics):
-                MQTT.publishMessage(client, f'{mqttRootTopic}/{topic}', messages[i])
-            while pygame.mixer.music.get_busy() == True:
-                continue
-            #time.sleep(1)
-        client.disconnect()
+            ringBell(client, topics[0])
+        #client.disconnect()
         
-    if str(fMatch.lastMatch.scanResult) == str(ScanResult.matchFound) or str(fMatch.lastMatch.scanResult) == str(ScanResult.noMatchFound):
+    """if str(fMatch.lastMatch.scanResult) == str(ScanResult.matchFound):# or str(fMatch.lastMatch.scanResult) == str(ScanResult.noMatchFound):
         client = MQTT.connect_mqtt()
         topics = ["ring", "matchId", "matchName", "matchConfidence"]
         messages = ["off", "-1", "", "-1"]
@@ -150,8 +155,8 @@ def doScan(self):
             MQTT.publishMessage(client, f'{mqttRootTopic}/{topic}', messages[i])  
         client.loop_start()
         time.sleep(1)
-        client.loop_stop()
-        client.disconnect()
+        client.loop_stop()"""
+    client.disconnect()
         
     fMatch.lastMatch = match
     return
@@ -424,13 +429,22 @@ class MQTT():
     def subscribe(client):
         mqttRootTopic = settingsManager.getAppSettings().mqttRootTopic
         def on_message(client, userdata, msg):
-            #print(f"Received `{msg.payload.decode()}` from `{msg.topic}` topic")
-            b = False
-            if msg.payload.decode().upper() == "TRUE":
-                b = True
-            FingerprintManager.setIgnoreTouchRing(b)
+            print(f"Received `{msg.payload.decode()}` from `{msg.topic}` topic")
+            if msg.topic == f'{mqttRootTopic}/ignoreTouchRing':
+                b = False
+                if msg.payload.decode().upper() == "TRUE":
+                    b = True
+                FingerprintManager.setIgnoreTouchRing(b)
+            elif msg.topic == f'{mqttRootTopic}/doorOpener':
+                b = False
+                if msg.payload.decode().upper() == "TRUE":
+                    b = True
+                    GPIO.output(doorOpenerPin,b)
+                    time.sleep(1)
+                    GPIO.output(doorOpenerPin,False)
+                    MQTT.publishMessage(client, f'{mqttRootTopic}/doorOpener', "False")
         
-        topics = ["ignoreTouchRing"]
+        topics = ["ignoreTouchRing", "doorOpener"]
         for topic in topics:
             client.subscribe(f'{mqttRootTopic}/{topic}')
         client.on_message = on_message
@@ -440,73 +454,27 @@ class MQTT():
         client.loop_start()
         publish(client)
 
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 44100
-#CHUNK = 1024
-CHUNK = 8192 
-RECORD_SECONDS = 5
-
-audio1 = pyaudio.PyAudio()
-
-def genHeader(sampleRate, bitsPerSample, channels):
-    datasize = 2000*10**6
-    o = bytes("RIFF",'ascii')                                               # (4byte) Marks file as RIFF
-    o += (datasize + 36).to_bytes(4,'little')                               # (4byte) File size in bytes excluding this and RIFF marker
-    o += bytes("WAVE",'ascii')                                              # (4byte) File type
-    o += bytes("fmt ",'ascii')                                              # (4byte) Format Chunk Marker
-    o += (16).to_bytes(4,'little')                                          # (4byte) Length of above format data
-    o += (1).to_bytes(2,'little')                                           # (2byte) Format type (1 - PCM)
-    o += (channels).to_bytes(2,'little')                                    # (2byte)
-    o += (sampleRate).to_bytes(4,'little')                                  # (4byte)
-    o += (sampleRate * channels * bitsPerSample // 8).to_bytes(4,'little')  # (4byte)
-    o += (channels * bitsPerSample // 8).to_bytes(2,'little')               # (2byte)
-    o += (bitsPerSample).to_bytes(2,'little')                               # (2byte)
-    o += bytes("data",'ascii')                                              # (4byte) Data Chunk Marker
-    o += (datasize).to_bytes(4,'little')                                    # (4byte) Data size in bytes
-    return o
-
-@app.route('/audio')
-def audio():
-    # start Recording
-    def sound():
-
-        #CHUNK = 1024
-        CHUNK = 8192 
-        sampleRate = 44100
-        bitsPerSample = 10
-        channels = 1
-        wav_header = genHeader(sampleRate, bitsPerSample, channels)
-
-        stream = audio1.open(format=FORMAT, channels=CHANNELS,
-                        rate=RATE, input=True,input_device_index=2,
-                        frames_per_buffer=CHUNK)
-        print("recording...")
-        #frames = []
-        first_run = True
-        while True:
-           if first_run:
-               data = wav_header + stream.read(CHUNK, exception_on_overflow = False)
-               first_run = False
-           else:
-               data = stream.read(CHUNK)
-           yield(data)
-
-    return Response(sound())
-
-@app.route('/')
-
-def switch_callback(channel):
+def touchRingPin_callback(channel):
     if not FingerprintManager.ignoreTouchRing:
         FingerprintManager.setLedRingScan()
         doScan("")
+        
+def bellPin_callback(channel):
+    if time.time() - BellPin.last > 0.5:        
+        mqttRootTopic = settingsManager.getAppSettings().mqttRootTopic
+        client = MQTT.connect_mqtt()
+        #topics = ["ring", "matchId", "matchName", "matchConfidence"]
+        ringBell(client, "ring")
+        client.disconnect()
+    BellPin.last = time.time()
     
 def start_server():
     address = ('', 8000)
     server = StreamingServer(address, StreamingHandler)
     server.serve_forever()
 
-GPIO.add_event_detect(touchRingPin, GPIO.FALLING, callback=switch_callback)
+GPIO.add_event_detect(touchRingPin, GPIO.FALLING, callback = touchRingPin_callback)
+GPIO.add_event_detect(bellPin, GPIO.FALLING, callback = bellPin_callback)
 
 fingerManager.connect()
 currentMode = Mode.scan
@@ -524,7 +492,11 @@ picam2.configure(picam2.create_video_configuration(main={"size": (1280, 1024)}))
 output = StreamingOutput()
 picam2.start_recording(JpegEncoder(), FileOutput(output))
 
+client = MQTT.connect_mqtt()
+MQTT.subscribe(client)
 while True:
+    
+
     if cMode.mode != cMode.lastMode:
         print(cMode.mode)
         cMode.lastMode = cMode.mode
@@ -538,3 +510,5 @@ while True:
     else:
         pass
     time.sleep(1)
+    #client.loop_stop()
+    #client.disconnect()
